@@ -1,0 +1,114 @@
+'use strict';
+const extractLinks = require('./extractLinks');
+const domNodesToCdt = require('./domNodesToCdt');
+const aggregateResourceUrlsAndBlobs = require('./aggregateResourceUrlsAndBlobs');
+const makeGetResourceUrlsAndBlobs = require('./getResourceUrlsAndBlobs');
+const makeProcessResource = require('./processResource');
+const makeExtractResourcesFromSvg = require('./makeExtractResourcesFromSvg');
+const fetchUrl = require('./fetchUrl');
+const makeFindStyleSheetByUrl = require('./findStyleSheetByUrl');
+const makeExtractResourcesFromStyleSheet = require('./extractResourcesFromStyleSheet');
+const extractResourceUrlsFromStyleAttrs = require('./extractResourceUrlsFromStyleAttrs');
+const makeExtractResourceUrlsFromStyleTags = require('./extractResourceUrlsFromStyleTags');
+const buildCanvasBlobs = require('./buildCanvasBlobs');
+const extractFrames = require('./extractFrames');
+const getBaesUrl = require('./getBaseUrl');
+const absolutizeUrl = require('./absolutizeUrl');
+const toUriEncoding = require('./toUriEncoding');
+const toUnAnchoredUri = require('./toUnAnchoredUri');
+const uniq = require('./uniq');
+const flat = require('./flat');
+const filterInlineUrl = require('./filterInlineUrl');
+
+function processPage(doc = document) {
+  const styleSheetCache = {};
+  const extractResourcesFromStyleSheet = makeExtractResourcesFromStyleSheet({styleSheetCache});
+  const findStyleSheetByUrl = makeFindStyleSheetByUrl({styleSheetCache});
+  const extractResourceUrlsFromStyleTags = makeExtractResourceUrlsFromStyleTags(
+    extractResourcesFromStyleSheet,
+  );
+
+  const extractResourcesFromSvg = makeExtractResourcesFromSvg({extractResourceUrlsFromStyleTags});
+  const processResource = makeProcessResource({
+    fetchUrl,
+    findStyleSheetByUrl,
+    extractResourcesFromStyleSheet,
+    extractResourcesFromSvg,
+    absolutizeUrl,
+  });
+
+  const getResourceUrlsAndBlobs = makeGetResourceUrlsAndBlobs({
+    processResource,
+    aggregateResourceUrlsAndBlobs,
+  });
+
+  return doProcessPage(doc);
+
+  function doProcessPage(doc, baesUrl = null) {
+    const url = baesUrl || getBaesUrl(doc);
+    const {cdt, docRoots, canvasElements, inlineFrames} = domNodesToCdt(doc, url);
+
+    const linkUrls = flat(docRoots.map(extractLinks));
+    const styleTagUrls = flat(docRoots.map(extractResourceUrlsFromStyleTags));
+    const absolutizeThisUrl = getAbsolutizeByUrl(url);
+    const links = uniq(
+      Array.from(linkUrls)
+        .concat(Array.from(styleTagUrls))
+        .concat(extractResourceUrlsFromStyleAttrs(cdt)),
+    )
+      .map(toUnAnchoredUri)
+      .map(toUriEncoding)
+      .map(absolutizeThisUrl)
+      .filter(filterInlineUrlsIfExisting);
+
+    const resourceUrlsAndBlobsPromise = getResourceUrlsAndBlobs(docRoots, url, links);
+    const canvasBlobs = buildCanvasBlobs(canvasElements);
+
+    const frameDocs = extractFrames(docRoots);
+    const processFramesPromise = frameDocs.map(f => doProcessPage(f, null));
+    const processInlineFramesPromise = inlineFrames.map(({element, url}) =>
+      doProcessPage(element.contentDocument, url),
+    );
+
+    const frameElement = doc.defaultView && doc.defaultView.frameElement;
+    return Promise.all([
+      resourceUrlsAndBlobsPromise,
+      ...processFramesPromise,
+      ...processInlineFramesPromise,
+    ]).then(([{resourceUrls, blobsObj}, ...framesResults]) => ({
+      cdt,
+      url,
+      resourceUrls,
+      blobs: [...blobsObjToArray(blobsObj), ...canvasBlobs],
+      frames: framesResults,
+      srcAttr: frameElement ? frameElement.getAttribute('src') : undefined,
+    }));
+  }
+}
+
+function getAbsolutizeByUrl(url) {
+  return function(someUrl) {
+    try {
+      return absolutizeUrl(someUrl, url);
+    } catch (err) {
+      // can't do anything with a non-absolute url
+    }
+  };
+}
+
+function blobsObjToArray(blobsObj) {
+  return Object.keys(blobsObj).map(blobUrl =>
+    Object.assign(
+      {
+        url: blobUrl.replace(/^blob:/, ''),
+      },
+      blobsObj[blobUrl],
+    ),
+  );
+}
+
+function filterInlineUrlsIfExisting(absoluteUrl) {
+  return absoluteUrl && filterInlineUrl(absoluteUrl);
+}
+
+module.exports = processPage;
